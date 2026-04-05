@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dispatcher Dashboard — Microservices Gateway</title>
+  <meta name="description" content="Real-time traffic monitoring dashboard for the API Gateway Dispatcher microservices architecture." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/css/styles.css" />
+</head>
+<body>
+  <div class="bg-grid"></div>
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header-inner">
+      <div class="logo">
+        <span class="logo-icon">⬡</span>
+        <div>
+          <h1 class="logo-title">Dispatcher</h1>
+          <span class="logo-sub">API Gateway Dashboard</span>
+        </div>
+      </div>
+      <div class="header-right">
+        <div class="live-badge" id="live-badge">
+          <span class="live-dot"></span> LIVE
+        </div>
+        <div class="last-update" id="last-update">Connecting...</div>
+        <a class="btn-grafana" href="http://localhost:3000" target="_blank">Open Grafana ↗</a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Stats Cards -->
+  <main class="main">
+    <section class="stats-grid">
+      <div class="stat-card" id="card-total">
+        <div class="stat-icon">📊</div>
+        <div class="stat-body">
+          <div class="stat-value" id="total-requests">—</div>
+          <div class="stat-label">Total Requests</div>
+        </div>
+      </div>
+      <div class="stat-card success" id="card-success">
+        <div class="stat-icon">✅</div>
+        <div class="stat-body">
+          <div class="stat-value" id="success-count">—</div>
+          <div class="stat-label">Successful</div>
+        </div>
+      </div>
+      <div class="stat-card error" id="card-error">
+        <div class="stat-icon">⚠️</div>
+        <div class="stat-body">
+          <div class="stat-value" id="error-count">—</div>
+          <div class="stat-label">Errors</div>
+        </div>
+      </div>
+      <div class="stat-card perf">
+        <div class="stat-icon">⚡</div>
+        <div class="stat-body">
+          <div class="stat-value" id="avg-latency">—</div>
+          <div class="stat-label">Avg Latency (ms)</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Service Health -->
+    <section class="panel">
+      <div class="panel-header">
+        <h2 class="panel-title">Service Health</h2>
+        <button class="btn-refresh" onclick="refreshAll()">↻ Refresh</button>
+      </div>
+      <div class="services-grid" id="services-grid">
+        <div class="service-skeleton"></div>
+        <div class="service-skeleton"></div>
+        <div class="service-skeleton"></div>
+        <div class="service-skeleton"></div>
+        <div class="service-skeleton"></div>
+      </div>
+    </section>
+
+    <!-- Traffic per service bar chart -->
+    <section class="panel">
+      <h2 class="panel-title">Traffic by Service</h2>
+      <div class="bar-chart" id="bar-chart">
+        <div class="chart-loading">Waiting for data...</div>
+      </div>
+    </section>
+
+    <!-- Request Logs Table -->
+    <section class="panel">
+      <div class="panel-header">
+        <h2 class="panel-title">Recent Request Logs</h2>
+        <div class="log-controls">
+          <select id="log-filter" onchange="applyFilter()">
+            <option value="">All Services</option>
+            <option value="login-service">Login</option>
+            <option value="message-service">Messages</option>
+            <option value="user-service">Users</option>
+            <option value="product-service">Products</option>
+            <option value="report-service">Reports</option>
+          </select>
+          <select id="status-filter" onchange="applyFilter()">
+            <option value="">All Statuses</option>
+            <option value="2">2xx Success</option>
+            <option value="4">4xx Client Error</option>
+            <option value="5">5xx Server Error</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="table-wrapper">
+        <table class="log-table" id="log-table">
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Method</th>
+              <th>Path</th>
+              <th>Service</th>
+              <th>Status</th>
+              <th>Latency</th>
+              <th>User</th>
+            </tr>
+          </thead>
+          <tbody id="log-tbody">
+            <tr><td colspan="7" class="loading-row">Loading logs...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>Dispatcher API Gateway • Microservices Architecture</span>
+    <span>Grafana: <a href="http://localhost:3000" target="_blank">localhost:3000</a> • Prometheus: <a href="http://localhost:9090" target="_blank">localhost:9090</a></span>
+  </footer>
+
+  <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
