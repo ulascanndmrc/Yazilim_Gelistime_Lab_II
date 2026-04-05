@@ -1,0 +1,2730 @@
+﻿--- C:\Users\mehme\OneDrive\Desktop\yazlab2\dispatcher\app\auth_middleware.py ---
+"""
+GREEN PHASE: Auth middleware implementation satisfying TDD tests.
+Implements JWT validation, public route detection, and role checks.
+"""
+from typing import Optional
+import jwt as pyjwt
+from app.config import settings
+
+
+# â”€â”€â”€ Custom Exception Hierarchy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class AuthError(Exception):
+    status_code: int = 401
+    detail: str = "Authentication failed"
+
+
+class MissingTokenError(AuthError):
+    detail = "Authorization token is missing"
+
+
+class TokenExpiredError(AuthError):
+    detail = "Token has expired"
+
+
+class InvalidTokenError(AuthError):
+    detail = "Invalid or malformed token"
+
+
+class InsufficientPermissionsError(AuthError):
+    status_code = 403
+    detail = "Insufficient permissions"
+
+
+# â”€â”€â”€ Public Routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+_PUBLIC_ROUTES = [
+    ("POST", "/auth/login"),
+    ("POST", "/auth/register"),
+    ("GET",  "/health"),
+    ("GET",  "/metrics"),
+    ("GET",  "/dashboard"),
+    ("GET",  "/static"),
+    ("GET",  "/api/gateway"),
+]
+
+
+def is_public_route(method: str, path: str) -> bool:
+    """Return True if the route does not require JWT authentication."""
+    for pub_method, pub_prefix in _PUBLIC_ROUTES:
+        if method.upper() == pub_method and path.startswith(pub_prefix):
+            return True
+    if path.startswith("/static/"):
+        return True
+    return False
+
+
+# â”€â”€â”€ Token Utilities â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def validate_token(token: Optional[str], secret: str) -> dict:
+    """
+    Decode and validate a JWT token.
+
+    Raises:
+        MissingTokenError   â€“ token is None or empty
+        TokenExpiredError   â€“ token has expired
+        InvalidTokenError   â€“ signature/format invalid
+    """
+    if not token:
+        raise MissingTokenError()
+    try:
+        payload = pyjwt.decode(token, secret, algorithms=[settings.jwt_algorithm])
+        return payload
+    except pyjwt.ExpiredSignatureError:
+        raise TokenExpiredError()
+    except pyjwt.InvalidTokenError:
+        raise InvalidTokenError()
+
+
+def extract_token_from_header(authorization: Optional[str]) -> Optional[str]:
+    """Extract the raw token from a 'Bearer <token>' Authorization header."""
+    if not authorization:
+        return None
+    parts = authorization.strip().split(" ")
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1]
+    return None
+
+
+def has_required_role(payload: dict, required_role: str) -> bool:
+    """Check if the JWT payload satisfies the minimum role level."""
+    hierarchy = {"admin": 2, "user": 1, "guest": 0}
+    user_level = hierarchy.get(payload.get("role", "guest"), 0)
+    required_level = hierarchy.get(required_role, 0)
+    return user_level >= required_level
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\dispatcher\app\config.py ---
+import os
+
+
+class Settings:
+    """Application configuration loaded from environment variables."""
+    mongo_uri: str = os.getenv("MONGO_URI", "mongodb://localhost:27017/dispatcher_db")
+    jwt_secret: str = os.getenv("JWT_SECRET", "dev-secret-key")
+    jwt_algorithm: str = "HS256"
+    internal_api_key: str = os.getenv("INTERNAL_API_KEY", "internal-dev-key")
+    login_service_url: str = os.getenv("LOGIN_SERVICE_URL", "http://localhost:5001")
+    message_service_url: str = os.getenv("MESSAGE_SERVICE_URL", "http://localhost:5002")
+    user_service_url: str = os.getenv("USER_SERVICE_URL", "http://localhost:5003")
+    product_service_url: str = os.getenv("PRODUCT_SERVICE_URL", "http://localhost:5004")
+    report_service_url: str = os.getenv("REPORT_SERVICE_URL", "http://localhost:5005")
+
+
+settings = Settings()
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\dispatcher\app\database.py ---
+from motor.motor_asyncio import AsyncIOMotorClient
+from app.config import settings
+
+_client = None
+_db = None
+
+
+async def connect_to_mongo():
+    global _client, _db
+    _client = AsyncIOMotorClient(settings.mongo_uri)
+    _db = _client.get_default_database()
+    await _db.logs.create_index("timestamp")
+    await _db.logs.create_index("user_id")
+    await _db.logs.create_index("target_service")
+    print("[Dispatcher] Connected to MongoDB")
+
+
+async def close_mongo_connection():
+    global _client
+    if _client:
+        _client.close()
+
+
+def get_db():
+    return _db
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\dispatcher\app\logger.py ---
+"""
+GREEN PHASE: Request logger implementation satisfying TDD tests.
+Logs all traffic to MongoDB with full metadata.
+"""
+from datetime import datetime
+from typing import Optional
+from app.models import LogStatistics
+
+
+class RequestLogger:
+    """Logs every request/response through the Dispatcher to MongoDB."""
+
+    def __init__(self, db):
+        self._db = db
+
+    def build_log_entry(
+        self,
+        method: str,
+        path: str,
+        user_id: Optional[str],
+        target_service: str,
+        status_code: int,
+        response_time_ms: float,
+        error: Optional[str] = None,
+        ip_address: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> dict:
+        """Build a log entry dict (also used directly in tests)."""
+        return {
+            "method": method,
+            "path": path,
+            "user_id": user_id,
+            "target_service": target_service,
+            "status_code": status_code,
+            "response_time_ms": response_time_ms,
+            "timestamp": datetime.utcnow(),
+            "error": error,
+            "ip_address": ip_address,
+            "user_agent": user_agent,
+        }
+
+    async def log_request(
+        self,
+        method: str,
+        path: str,
+        user_id: Optional[str],
+        target_service: str,
+        status_code: int,
+        response_time_ms: float,
+        error: Optional[str] = None,
+        ip_address: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ):
+        """Persist a log entry to MongoDB (fire-and-forget)."""
+        entry = self.build_log_entry(
+            method, path, user_id, target_service,
+            status_code, response_time_ms, error, ip_address, user_agent
+        )
+        await self._db.logs.insert_one(entry)
+
+    async def get_recent_logs(self, limit: int = 100) -> list:
+        cursor = self._db.logs.find({}, {"_id": 0}).sort("timestamp", -1).limit(limit)
+        return await cursor.to_list(limit)
+
+    async def get_statistics(self) -> LogStatistics:
+        pipeline = [{"$facet": {
+            "total":   [{"$count": "count"}],
+            "success": [{"$match": {"status_code": {"$gte": 200, "$lt": 400}}}, {"$count": "count"}],
+            "errors":  [{"$match": {"status_code": {"$gte": 400}}}, {"$count": "count"}],
+            "avg_time":[{"$group": {"_id": None, "avg": {"$avg": "$response_time_ms"}}}],
+            "per_svc": [{"$group": {"_id": "$target_service", "count": {"$sum": 1}}}],
+        }}]
+        result = await self._db.logs.aggregate(pipeline).to_list(1)
+        if not result:
+            return LogStatistics(total_requests=0, success_count=0, error_count=0,
+                                 avg_response_time_ms=0.0, requests_per_service={})
+        r = result[0]
+        total   = r["total"][0]["count"]   if r["total"]   else 0
+        success = r["success"][0]["count"] if r["success"] else 0
+        errors  = r["errors"][0]["count"]  if r["errors"]  else 0
+        avg     = r["avg_time"][0]["avg"]  if r["avg_time"] else 0.0
+        per_svc = {item["_id"]: item["count"] for item in r["per_svc"]}
+        return LogStatistics(
+            total_requests=total, success_count=success, error_count=errors,
+            avg_response_time_ms=round(avg or 0.0, 2), requests_per_service=per_svc
+        )
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\dispatcher\app\main.py ---
+"""
+Dispatcher (API Gateway) â€” Main Application
+Central entry point routing all external traffic to microservices.
+"""
+import time
+from contextlib import asynccontextmanager
+from typing import Optional
+
+import httpx
+from fastapi import FastAPI, Request, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+
+from app.config import settings
+from app.database import connect_to_mongo, close_mongo_connection, get_db
+from app.auth_middleware import (
+    validate_token, extract_token_from_header, is_public_route,
+    MissingTokenError, TokenExpiredError, InvalidTokenError,
+)
+from app.logger import RequestLogger
+from app.router import get_service_url
+
+# â”€â”€â”€ Prometheus Metrics â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+REQUEST_COUNT = Counter(
+    "dispatcher_requests_total", "Total requests",
+    ["method", "service", "status_code"])
+REQUEST_LATENCY = Histogram(
+    "dispatcher_request_duration_seconds", "Request latency",
+    ["method", "service"])
+
+
+# â”€â”€â”€ Lifespan â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await connect_to_mongo()
+    yield
+    await close_mongo_connection()
+
+
+# â”€â”€â”€ App â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+app = FastAPI(
+    title="Dispatcher â€“ API Gateway",
+    description="Central gateway for all microservices traffic",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+# â”€â”€â”€ Internal Routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+@app.get("/metrics")
+async def metrics():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "service": "dispatcher"}
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    with open("static/index.html", "r", encoding="utf-8") as f:
+        return f.read()
+
+
+@app.get("/api/gateway/stats")
+async def gateway_stats():
+    logger = RequestLogger(get_db())
+    return await logger.get_statistics()
+
+
+@app.get("/api/gateway/logs")
+async def gateway_logs(limit: int = 100):
+    logger = RequestLogger(get_db())
+    logs = await logger.get_recent_logs(limit)
+    return {"logs": logs, "count": len(logs)}
+
+
+@app.get("/api/gateway/health")
+async def services_health():
+    services = {
+        "login-service":   settings.login_service_url,
+        "message-service": settings.message_service_url,
+        "user-service":    settings.user_service_url,
+        "product-service": settings.product_service_url,
+        "report-service":  settings.report_service_url,
+    }
+    result = {}
+    async with httpx.AsyncClient(timeout=3.0) as client:
+        for name, url in services.items():
+            try:
+                resp = await client.get(f"{url}/health")
+                status = "up" if resp.status_code == 200 else "degraded"
+                result[name] = {"status": status, "code": resp.status_code}
+            except Exception as e:
+                result[name] = {"status": "down", "error": str(e)}
+    return result
+
+
+# â”€â”€â”€ Proxy Handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy(path: str, request: Request):
+    full_path = f"/{path}"
+    method = request.method
+    start = time.time()
+    user_id: Optional[str] = None
+    service_name = "unknown"
+
+    # 1. JWT authentication (skip public routes)
+    if not is_public_route(method, full_path):
+        token = extract_token_from_header(request.headers.get("Authorization"))
+        try:
+            payload = validate_token(token, settings.jwt_secret)
+            user_id = payload.get("sub")
+        except MissingTokenError as e:
+            elapsed = (time.time() - start) * 1000
+            await _log(method, full_path, None, service_name, 401, elapsed, str(e.detail), request)
+            return JSONResponse(status_code=401, content={"detail": e.detail})
+        except TokenExpiredError as e:
+            elapsed = (time.time() - start) * 1000
+            await _log(method, full_path, None, service_name, 401, elapsed, str(e.detail), request)
+            return JSONResponse(status_code=401, content={"detail": e.detail})
+        except InvalidTokenError as e:
+            elapsed = (time.time() - start) * 1000
+            await _log(method, full_path, None, service_name, 401, elapsed, str(e.detail), request)
+            return JSONResponse(status_code=401, content={"detail": e.detail})
+
+    # 2. Route resolution
+    route_result = get_service_url(method, full_path)
+    if route_result is None:
+        elapsed = (time.time() - start) * 1000
+        await _log(method, full_path, user_id, "none", 404, elapsed, "No route", request)
+        return JSONResponse(status_code=404, content={"detail": f"No service for path: {full_path}"})
+
+    target_url, service_name = route_result
+
+    # 3. Forward request
+    try:
+        body = await request.body()
+        headers = {k: v for k, v in request.headers.items()
+                   if k.lower() not in ("host", "content-length")}
+        headers["X-Internal-Api-Key"] = settings.internal_api_key
+        if user_id:
+            headers["X-User-Id"] = user_id
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.request(
+                method=method, url=target_url, headers=headers,
+                content=body, params=dict(request.query_params))
+
+        elapsed = (time.time() - start) * 1000
+        REQUEST_COUNT.labels(method=method, service=service_name,
+                             status_code=str(resp.status_code)).inc()
+        REQUEST_LATENCY.labels(method=method, service=service_name).observe(elapsed / 1000)
+        await _log(method, full_path, user_id, service_name, resp.status_code, elapsed, None, request)
+
+        resp_headers = {k: v for k, v in resp.headers.items()
+                        if k.lower() not in ("content-encoding", "transfer-encoding", "connection")}
+        return Response(content=resp.content, status_code=resp.status_code,
+                        headers=resp_headers,
+                        media_type=resp.headers.get("content-type", "application/json"))
+
+    except httpx.ConnectError:
+        elapsed = (time.time() - start) * 1000
+        REQUEST_COUNT.labels(method=method, service=service_name, status_code="503").inc()
+        await _log(method, full_path, user_id, service_name, 503, elapsed, "Service unavailable", request)
+        return JSONResponse(status_code=503, content={"detail": f"'{service_name}' is unavailable"})
+
+    except httpx.TimeoutException:
+        elapsed = (time.time() - start) * 1000
+        REQUEST_COUNT.labels(method=method, service=service_name, status_code="504").inc()
+        await _log(method, full_path, user_id, service_name, 504, elapsed, "Gateway timeout", request)
+        return JSONResponse(status_code=504, content={"detail": f"'{service_name}' timed out"})
+
+    except Exception as e:
+        elapsed = (time.time() - start) * 1000
+        await _log(method, full_path, user_id, service_name, 502, elapsed, str(e), request)
+        return JSONResponse(status_code=502, content={"detail": "Bad gateway"})
+
+
+async def _log(method, path, user_id, service, status, elapsed, error, request):
+    try:
+        logger = RequestLogger(get_db())
+        await logger.log_request(
+            method=method, path=path, user_id=user_id,
+            target_service=service, status_code=status,
+            response_time_ms=elapsed, error=error,
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+        )
+    except Exception:
+        pass
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\dispatcher\app\models.py ---
+from pydantic import BaseModel
+from datetime import datetime
+from typing import Optional
+
+
+class RequestLog(BaseModel):
+    method: str
+    path: str
+    user_id: Optional[str] = None
+    target_service: str
+    status_code: int
+    response_time_ms: float
+    timestamp: datetime
+    error: Optional[str] = None
+    ip_address: Optional[str] = None
+    user_agent: Optional[str] = None
+
+
+class LogStatistics(BaseModel):
+    total_requests: int
+    success_count: int
+    error_count: int
+    avg_response_time_ms: float
+    requests_per_service: dict
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\dispatcher\app\router.py ---
+"""
+GREEN PHASE: Service router implementation satisfying TDD routing tests.
+Maps URL prefixes to microservice targets.
+"""
+from typing import Optional, Tuple
+from app.config import settings
+
+
+class ServiceRoute:
+    """Routing rule mapping a URL prefix to a microservice."""
+
+    def __init__(self, prefix: str, service_url: str, service_name: str):
+        self.prefix = prefix
+        self.service_url = service_url
+        self.service_name = service_name
+
+    def matches(self, path: str) -> bool:
+        return path.startswith(self.prefix)
+
+    def build_target_url(self, path: str) -> str:
+        return f"{self.service_url}{path}"
+
+
+class ServiceRouter:
+    """Routes requests to microservices based on URL prefix matching."""
+
+    def __init__(self):
+        self._routes: list = []
+
+    def add_route(self, prefix: str, service_url: str, service_name: str) -> None:
+        self._routes.append(ServiceRoute(prefix, service_url, service_name))
+
+    def resolve(self, path: str) -> Optional[Tuple[str, str]]:
+        """Return (target_url, service_name) or None if no route matches."""
+        for route in self._routes:
+            if route.matches(path):
+                return route.build_target_url(path), route.service_name
+        return None
+
+
+# Module-level singleton router
+_router = ServiceRouter()
+_router.add_route("/auth/",          settings.login_service_url,   "login-service")
+_router.add_route("/api/messages",   settings.message_service_url, "message-service")
+_router.add_route("/api/users",      settings.user_service_url,    "user-service")
+_router.add_route("/api/products",   settings.product_service_url, "product-service")
+_router.add_route("/api/reports",    settings.report_service_url,  "report-service")
+
+
+def get_service_url(method: str, path: str) -> Optional[Tuple[str, str]]:
+    """Resolve a path to (target_url, service_name). Returns None if not found."""
+    return _router.resolve(path)
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\dispatcher\app\__init__.py ---
+# dispatcher/app/__init__.py
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\dispatcher\static\css\styles.css ---
+/* â”€â”€â”€ Base â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:        #0a0e1a;
+  --bg2:       #0f1526;
+  --surface:   #141b2d;
+  --surface2:  #1a2340;
+  --border:    rgba(99,120,200,.18);
+  --text:      #e2e8f8;
+  --text-muted:#7a88aa;
+  --accent:    #6c8fff;
+  --success:   #22d3a5;
+  --error:     #f87171;
+  --warning:   #fbbf24;
+  --purple:    #a78bfa;
+  --font:      'Inter', sans-serif;
+  --mono:      'JetBrains Mono', monospace;
+}
+
+html { font-size: 16px; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* â”€â”€â”€ Animated grid background â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+.bg-grid {
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background-image:
+    linear-gradient(rgba(108,143,255,.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(108,143,255,.04) 1px, transparent 1px);
+  background-size: 40px 40px;
+  animation: gridDrift 40s linear infinite;
+}
+@keyframes gridDrift {
+  0%   { background-position: 0 0; }
+  100% { background-position: 40px 40px; }
+}
+
+/* â”€â”€â”€ Header â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+.header {
+  position: sticky; top: 0; z-index: 100;
+  background: rgba(10,14,26,.85);
+  backdrop-filter: blur(16px);
+  border-bottom: 1px solid var(--border);
+  padding: .75rem 2rem;
+}
+.header-inner {
+  max-width: 1400px; margin: 0 auto;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.logo { display: flex; align-items: center; gap: .85rem; }
+.logo-icon {
+  font-size: 1.8rem;
+  background: linear-gradient(135deg, var(--accent), var(--purple));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  filter: drop-shadow(0 0 8px rgba(108,143,255,.4));
+}
+.logo-title { font-size: 1.1rem; font-weight: 700; letter-spacing: -.02em; }
+.logo-sub   { font-size: .7rem; color: var(--text-muted); letter-spacing: .06em; text-transform: uppercase; }
+.header-right { display: flex; align-items: center; gap: 1rem; }
+.live-badge {
+  display: flex; align-items: center; gap: .4rem;
+  font-size: .7rem; font-weight: 600; letter-spacing: .08em;
+  color: var(--success); text-transform: uppercase;
+}
+.live-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 6px var(--success);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%,100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: .6; transform: scale(1.3); }
+}
+.last-update { font-size: .72rem; color: var(--text-muted); font-family: var(--mono); }
+.btn-grafana {
+  background: linear-gradient(135deg, var(--accent), var(--purple));
+  color: #fff; text-decoration: none;
+  padding: .45rem 1rem; border-radius: 8px;
+  font-size: .78rem; font-weight: 600;
+  transition: opacity .2s, transform .2s;
+}
+.btn-grafana:hover { opacity: .85; transform: translateY(-1px); }
+
+/* â”€â”€â”€ Main layout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+.main {
+  position: relative; z-index: 1;
+  max-width: 1400px; margin: 0 auto;
+  padding: 2rem 2rem 4rem;
+  display: flex; flex-direction: column; gap: 1.5rem;
+}
+
+/* â”€â”€â”€ Stats grid â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px,1fr));
+  gap: 1rem;
+}
+.stat-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 1.5rem;
+  display: flex; align-items: center; gap: 1rem;
+  transition: transform .2s, box-shadow .2s;
+  position: relative; overflow: hidden;
+}
+.stat-card::before {
+  content: '';
+  position: absolute; top: 0; left: 0; right: 0; height: 2px;
+  background: linear-gradient(90deg, var(--accent), var(--purple));
+  opacity: 0; transition: opacity .3s;
+}
+.stat-card:hover { transform: translateY(-3px); box-shadow: 0 12px 40px rgba(0,0,0,.4); }
+.stat-card:hover::before { opacity: 1; }
+.stat-card.success::before { background: linear-gradient(90deg, var(--success), #0ea5e9); opacity: 1; }
+.stat-card.error::before   { background: linear-gradient(90deg, var(--error), var(--warning)); opacity: 1; }
+.stat-card.perf::before    { background: linear-gradient(90deg, var(--purple), var(--accent)); opacity: 1; }
+.stat-icon { font-size: 2rem; }
+.stat-value { font-size: 2rem; font-weight: 700; font-family: var(--mono); letter-spacing: -.03em; }
+.stat-label { font-size: .75rem; color: var(--text-muted); margin-top: .2rem; letter-spacing: .04em; }
+
+/* â”€â”€â”€ Panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 1.5rem;
+}
+.panel-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 1.2rem;
+}
+.panel-title { font-size: 1rem; font-weight: 600; letter-spacing: -.01em; }
+.btn-refresh {
+  background: var(--surface2); border: 1px solid var(--border);
+  color: var(--text); padding: .35rem .85rem; border-radius: 8px;
+  font-size: .78rem; cursor: pointer; transition: background .2s;
+}
+.btn-refresh:hover { background: var(--border); }
+
+/* â”€â”€â”€ Service health grid â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+.services-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 1rem;
+}
+.service-card {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1rem;
+  text-align: center;
+  transition: transform .2s;
+}
+.service-card:hover { transform: translateY(-2px); }
+.service-card .svc-name { font-size: .85rem; font-weight: 600; margin-bottom: .5rem; }
+.service-card .svc-status {
+  display: inline-flex; align-items: center; gap: .35rem;
+  font-size: .75rem; font-weight: 500; padding: .25rem .7rem; border-radius: 20px;
+}
+.status-up      { background: rgba(34,211,165,.15); color: var(--success); }
+.status-down    { background: rgba(248,113,113,.15); color: var(--error); }
+.status-degraded{ background: rgba(251,191,36,.15);  color: var(--warning); }
+.service-skeleton {
+  background: var(--surface2); border-radius: 12px; height: 90px;
+  animation: shimmer 1.5s infinite;
+}
+@keyframes shimmer {
+  0%,100% { opacity: .5; }
+  50%      { opacity: 1; }
+}
+
+/* â”€â”€â”€ Bar chart â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+.bar-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 1rem;
+  height: 160px;
+  padding: 0 .5rem;
+  border-bottom: 1px solid var(--border);
+  position: relative;
+}
+.chart-loading { color: var(--text-muted); font-size: .85rem; margin: auto; }
+.bar-wrap {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: .4rem;
+}
+.bar {
+  width: 100%;
+  border-radius: 6px 6px 0 0;
+  background: linear-gradient(180deg, var(--accent), var(--purple));
+  box-shadow: 0 0 12px rgba(108,143,255,.3);
+  transition: height .6s cubic-bezier(.34,1.56,.64,1);
+  min-height: 4px;
+  cursor: pointer;
+  position: relative;
+}
+.bar:hover { filter: brightness(1.2); }
+.bar-label { font-size: .65rem; color: var(--text-muted); text-align: center; }
+.bar-count  { font-size: .7rem; font-family: var(--mono); color: var(--accent); font-weight: 600; }
+
+/* â”€â”€â”€ Log table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+.log-controls {
+  display: flex; gap: .6rem;
+}
+.log-controls select {
+  background: var(--surface2); border: 1px solid var(--border);
+  color: var(--text); padding: .3rem .6rem; border-radius: 8px;
+  font-size: .78rem; cursor: pointer; font-family: var(--font);
+}
+.table-wrapper {
+  overflow-x: auto; margin-top: 1rem;
+  border-radius: 10px; border: 1px solid var(--border);
+}
+.log-table {
+  width: 100%; border-collapse: collapse;
+  font-size: .78rem;
+}
+.log-table th {
+  background: var(--surface2);
+  color: var(--text-muted);
+  padding: .75rem 1rem;
+  text-align: left;
+  font-weight: 500;
+  letter-spacing: .04em;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.log-table td {
+  padding: .6rem 1rem;
+  border-bottom: 1px solid rgba(99,120,200,.08);
+  font-family: var(--mono);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.log-table tbody tr:hover { background: var(--surface2); }
+.log-table tbody tr:last-child td { border-bottom: none; }
+.loading-row { text-align: center; color: var(--text-muted); padding: 2rem !important; font-family: var(--font); }
+
+.method-badge {
+  display: inline-block;
+  padding: .15rem .55rem; border-radius: 6px;
+  font-size: .7rem; font-weight: 600; letter-spacing: .04em;
+}
+.method-GET    { background: rgba(34,211,165,.15); color: var(--success); }
+.method-POST   { background: rgba(108,143,255,.15); color: var(--accent); }
+.method-PUT    { background: rgba(251,191,36,.15);  color: var(--warning); }
+.method-DELETE { background: rgba(248,113,113,.15); color: var(--error); }
+.method-PATCH  { background: rgba(167,139,250,.15); color: var(--purple); }
+
+.status-badge {
+  display: inline-block;
+  padding: .15rem .55rem; border-radius: 6px;
+  font-size: .72rem; font-weight: 600;
+}
+.status-2xx { background: rgba(34,211,165,.15); color: var(--success); }
+.status-4xx { background: rgba(251,191,36,.15);  color: var(--warning); }
+.status-5xx { background: rgba(248,113,113,.15); color: var(--error); }
+
+/* â”€â”€â”€ Footer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+.footer {
+  position: relative; z-index: 1;
+  text-align: center; padding: 1.5rem;
+  color: var(--text-muted); font-size: .75rem;
+  display: flex; justify-content: space-between;
+  max-width: 1400px; margin: 0 auto;
+}
+.footer a { color: var(--accent); text-decoration: none; }
+
+/* â”€â”€â”€ Responsive â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+@media (max-width: 768px) {
+  .header-inner { flex-direction: column; gap: .75rem; }
+  .main { padding: 1rem 1rem 3rem; }
+  .footer { flex-direction: column; gap: .5rem; text-align: center; }
+}
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\dispatcher\static\js\dashboard.js ---
+'use strict';
+
+const API = '';  // same origin
+const REFRESH_MS = 5000;
+
+let allLogs = [];
+let filterService = '';
+let filterStatus = '';
+
+// â”€â”€â”€ Bootstrap â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+async function refreshAll() {
+  await Promise.all([fetchStats(), fetchHealth(), fetchLogs()]);
+  document.getElementById('last-update').textContent =
+    'Updated ' + new Date().toLocaleTimeString();
+}
+
+// â”€â”€â”€ Stats â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+async function fetchStats() {
+  try {
+    const res = await fetch(`${API}/api/gateway/stats`);
+    if (!res.ok) return;
+    const d = await res.json();
+
+    setText('total-requests', fmt(d.total_requests));
+    setText('success-count',  fmt(d.success_count));
+    setText('error-count',    fmt(d.error_count));
+    setText('avg-latency',    (d.avg_response_time_ms || 0).toFixed(1));
+
+    renderBarChart(d.requests_per_service || {});
+  } catch (e) {
+    console.warn('stats error', e);
+  }
+}
+
+// â”€â”€â”€ Service health â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+async function fetchHealth() {
+  try {
+    const res = await fetch(`${API}/api/gateway/health`);
+    if (!res.ok) return;
+    const data = await res.json();
+    renderServices(data);
+  } catch (e) {
+    console.warn('health error', e);
+  }
+}
+
+function renderServices(data) {
+  const grid = document.getElementById('services-grid');
+  grid.innerHTML = '';
+  const icons = {
+    'login-service':   'ğŸ”‘',
+    'message-service': 'ğŸ’¬',
+    'user-service':    'ğŸ‘¤',
+    'product-service': 'ğŸ“¦',
+    'report-service':  'ğŸ“ˆ',
+  };
+  for (const [name, info] of Object.entries(data)) {
+    const cls = info.status === 'up' ? 'status-up'
+              : info.status === 'down' ? 'status-down' : 'status-degraded';
+    const dot = info.status === 'up' ? 'â— Up'
+              : info.status === 'down' ? 'â— Down' : 'â— Degraded';
+    const card = document.createElement('div');
+    card.className = 'service-card';
+    card.innerHTML = `
+      <div class="svc-name">${icons[name] || 'â¬¡'} ${name}</div>
+      <div class="svc-status ${cls}">${dot}</div>`;
+    grid.appendChild(card);
+  }
+}
+
+// â”€â”€â”€ Bar chart â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+function renderBarChart(perService) {
+  const chart = document.getElementById('bar-chart');
+  const entries = Object.entries(perService);
+  if (!entries.length) {
+    chart.innerHTML = '<div class="chart-loading">No traffic yet</div>';
+    return;
+  }
+  const max = Math.max(...entries.map(([, v]) => v), 1);
+  chart.innerHTML = '';
+  const colors = {
+    'login-service':   'linear-gradient(180deg,#6c8fff,#a78bfa)',
+    'message-service': 'linear-gradient(180deg,#22d3a5,#0ea5e9)',
+    'user-service':    'linear-gradient(180deg,#fbbf24,#f97316)',
+    'product-service': 'linear-gradient(180deg,#f87171,#ec4899)',
+    'report-service':  'linear-gradient(180deg,#a78bfa,#6c8fff)',
+  };
+  entries.forEach(([svc, count]) => {
+    const pct = Math.max((count / max) * 140, 4);
+    const wrap = document.createElement('div');
+    wrap.className = 'bar-wrap';
+    wrap.innerHTML = `
+      <div class="bar-count">${fmt(count)}</div>
+      <div class="bar" style="height:${pct}px;background:${colors[svc] || 'var(--accent)'}"></div>
+      <div class="bar-label">${svc.replace('-service','')}</div>`;
+    chart.appendChild(wrap);
+  });
+}
+
+// â”€â”€â”€ Logs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+async function fetchLogs() {
+  try {
+    const res = await fetch(`${API}/api/gateway/logs?limit=200`);
+    if (!res.ok) return;
+    const { logs } = await res.json();
+    allLogs = logs || [];
+    renderLogs();
+  } catch (e) {
+    console.warn('logs error', e);
+  }
+}
+
+function applyFilter() {
+  filterService = document.getElementById('log-filter').value;
+  filterStatus  = document.getElementById('status-filter').value;
+  renderLogs();
+}
+
+function renderLogs() {
+  let rows = allLogs;
+  if (filterService) rows = rows.filter(l => l.target_service === filterService);
+  if (filterStatus)  rows = rows.filter(l => String(l.status_code).startsWith(filterStatus));
+  rows = rows.slice(0, 100);
+
+  const tbody = document.getElementById('log-tbody');
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="7" class="loading-row">No logs match the filter</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(log => {
+    const ts   = formatTime(log.timestamp);
+    const meth = methodBadge(log.method || '');
+    const sc   = statusBadge(log.status_code);
+    const lat  = (log.response_time_ms || 0).toFixed(1) + ' ms';
+    const usr  = log.user_id ? log.user_id.slice(-8) : 'â€”';
+    const path = (log.path || '').slice(0, 40);
+    const svc  = log.target_service || 'â€”';
+    return `<tr>
+      <td>${ts}</td>
+      <td>${meth}</td>
+      <td title="${log.path}">${path}</td>
+      <td>${svc}</td>
+      <td>${sc}</td>
+      <td>${lat}</td>
+      <td>${usr}</td>
+    </tr>`;
+  }).join('');
+}
+
+// â”€â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+function setText(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = val;
+}
+
+function fmt(n) {
+  return Number(n || 0).toLocaleString();
+}
+
+function formatTime(ts) {
+  if (!ts) return 'â€”';
+  const d = new Date(ts);
+  return isNaN(d) ? ts : d.toLocaleTimeString();
+}
+
+function methodBadge(m) {
+  return `<span class="method-badge method-${m}">${m}</span>`;
+}
+
+function statusBadge(code) {
+  const c = Number(code);
+  const cls = c >= 500 ? 'status-5xx' : c >= 400 ? 'status-4xx' : 'status-2xx';
+  return `<span class="status-badge ${cls}">${code}</span>`;
+}
+
+// â”€â”€â”€ Init â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+refreshAll();
+setInterval(refreshAll, REFRESH_MS);
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\dispatcher\static\index.html ---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dispatcher Dashboard â€” Microservices Gateway</title>
+  <meta name="description" content="Real-time traffic monitoring dashboard for the API Gateway Dispatcher microservices architecture." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/css/styles.css" />
+</head>
+<body>
+  <div class="bg-grid"></div>
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header-inner">
+      <div class="logo">
+        <span class="logo-icon">â¬¡</span>
+        <div>
+          <h1 class="logo-title">Dispatcher</h1>
+          <span class="logo-sub">API Gateway Dashboard</span>
+        </div>
+      </div>
+      <div class="header-right">
+        <div class="live-badge" id="live-badge">
+          <span class="live-dot"></span> LIVE
+        </div>
+        <div class="last-update" id="last-update">Connecting...</div>
+        <a class="btn-grafana" href="http://localhost:3000" target="_blank">Open Grafana â†—</a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Stats Cards -->
+  <main class="main">
+    <section class="stats-grid">
+      <div class="stat-card" id="card-total">
+        <div class="stat-icon">ğŸ“Š</div>
+        <div class="stat-body">
+          <div class="stat-value" id="total-requests">â€”</div>
+          <div class="stat-label">Total Requests</div>
+        </div>
+      </div>
+      <div class="stat-card success" id="card-success">
+        <div class="stat-icon">âœ…</div>
+        <div class="stat-body">
+          <div class="stat-value" id="success-count">â€”</div>
+          <div class="stat-label">Successful</div>
+        </div>
+      </div>
+      <div class="stat-card error" id="card-error">
+        <div class="stat-icon">âš ï¸</div>
+        <div class="stat-body">
+          <div class="stat-value" id="error-count">â€”</div>
+          <div class="stat-label">Errors</div>
+        </div>
+      </div>
+      <div class="stat-card perf">
+        <div class="stat-icon">âš¡</div>
+        <div class="stat-body">
+          <div class="stat-value" id="avg-latency">â€”</div>
+          <div class="stat-label">Avg Latency (ms)</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Service Health -->
+    <section class="panel">
+      <div class="panel-header">
+        <h2 class="panel-title">Service Health</h2>
+        <button class="btn-refresh" onclick="refreshAll()">â†» Refresh</button>
+      </div>
+      <div class="services-grid" id="services-grid">
+        <div class="service-skeleton"></div>
+        <div class="service-skeleton"></div>
+        <div class="service-skeleton"></div>
+        <div class="service-skeleton"></div>
+        <div class="service-skeleton"></div>
+      </div>
+    </section>
+
+    <!-- Traffic per service bar chart -->
+    <section class="panel">
+      <h2 class="panel-title">Traffic by Service</h2>
+      <div class="bar-chart" id="bar-chart">
+        <div class="chart-loading">Waiting for data...</div>
+      </div>
+    </section>
+
+    <!-- Request Logs Table -->
+    <section class="panel">
+      <div class="panel-header">
+        <h2 class="panel-title">Recent Request Logs</h2>
+        <div class="log-controls">
+          <select id="log-filter" onchange="applyFilter()">
+            <option value="">All Services</option>
+            <option value="login-service">Login</option>
+            <option value="message-service">Messages</option>
+            <option value="user-service">Users</option>
+            <option value="product-service">Products</option>
+            <option value="report-service">Reports</option>
+          </select>
+          <select id="status-filter" onchange="applyFilter()">
+            <option value="">All Statuses</option>
+            <option value="2">2xx Success</option>
+            <option value="4">4xx Client Error</option>
+            <option value="5">5xx Server Error</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="table-wrapper">
+        <table class="log-table" id="log-table">
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Method</th>
+              <th>Path</th>
+              <th>Service</th>
+              <th>Status</th>
+              <th>Latency</th>
+              <th>User</th>
+            </tr>
+          </thead>
+          <tbody id="log-tbody">
+            <tr><td colspan="7" class="loading-row">Loading logs...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>Dispatcher API Gateway â€¢ Microservices Architecture</span>
+    <span>Grafana: <a href="http://localhost:3000" target="_blank">localhost:3000</a> â€¢ Prometheus: <a href="http://localhost:9090" target="_blank">localhost:9090</a></span>
+  </footer>
+
+  <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\dispatcher\tests\test_auth.py ---
+"""
+TDD - RED PHASE: Auth/JWT validation tests for the Dispatcher.
+Written BEFORE implementation (Red-Green-Refactor cycle).
+File created: dispatcher/tests/test_auth.py  <-- BEFORE dispatcher/app/auth_middleware.py
+"""
+import pytest
+import sys
+import os
+from datetime import datetime, timedelta
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+JWT_SECRET = "test-secret-key"
+ALGORITHM = "HS256"
+
+
+def _make_token(payload: dict, secret: str = JWT_SECRET, expired: bool = False) -> str:
+    import jwt
+    data = payload.copy()
+    exp = datetime.utcnow() + (timedelta(seconds=-10) if expired else timedelta(hours=1))
+    data["exp"] = exp
+    return jwt.encode(data, secret, algorithm=ALGORITHM)
+
+
+class TestJWTValidation:
+
+    def test_valid_token_returns_payload(self):
+        from app.auth_middleware import validate_token
+        token = _make_token({"sub": "user123", "role": "user"})
+        payload = validate_token(token, JWT_SECRET)
+        assert payload["sub"] == "user123"
+        assert payload["role"] == "user"
+
+    def test_expired_token_raises_TokenExpiredError(self):
+        from app.auth_middleware import validate_token, TokenExpiredError
+        token = _make_token({"sub": "user123"}, expired=True)
+        with pytest.raises(TokenExpiredError):
+            validate_token(token, JWT_SECRET)
+
+    def test_wrong_secret_raises_InvalidTokenError(self):
+        from app.auth_middleware import validate_token, InvalidTokenError
+        token = _make_token({"sub": "user123"}, secret="wrong-secret")
+        with pytest.raises(InvalidTokenError):
+            validate_token(token, JWT_SECRET)
+
+    def test_none_token_raises_MissingTokenError(self):
+        from app.auth_middleware import validate_token, MissingTokenError
+        with pytest.raises(MissingTokenError):
+            validate_token(None, JWT_SECRET)
+
+    def test_empty_token_raises_MissingTokenError(self):
+        from app.auth_middleware import validate_token, MissingTokenError
+        with pytest.raises(MissingTokenError):
+            validate_token("", JWT_SECRET)
+
+
+class TestPublicRoutes:
+
+    def test_login_is_public(self):
+        from app.auth_middleware import is_public_route
+        assert is_public_route("POST", "/auth/login") is True
+
+    def test_register_is_public(self):
+        from app.auth_middleware import is_public_route
+        assert is_public_route("POST", "/auth/register") is True
+
+    def test_health_is_public(self):
+        from app.auth_middleware import is_public_route
+        assert is_public_route("GET", "/health") is True
+
+    def test_dashboard_is_public(self):
+        from app.auth_middleware import is_public_route
+        assert is_public_route("GET", "/dashboard") is True
+
+    def test_api_messages_is_protected(self):
+        from app.auth_middleware import is_public_route
+        assert is_public_route("GET", "/api/messages") is False
+
+    def test_api_users_is_protected(self):
+        from app.auth_middleware import is_public_route
+        assert is_public_route("GET", "/api/users") is False
+
+    def test_api_products_is_protected(self):
+        from app.auth_middleware import is_public_route
+        assert is_public_route("DELETE", "/api/products/1") is False
+
+
+class TestRoleAuthorization:
+
+    def test_admin_passes_admin_check(self):
+        from app.auth_middleware import has_required_role
+        assert has_required_role({"role": "admin"}, "admin") is True
+
+    def test_user_fails_admin_check(self):
+        from app.auth_middleware import has_required_role
+        assert has_required_role({"role": "user"}, "admin") is False
+
+    def test_admin_passes_user_check(self):
+        from app.auth_middleware import has_required_role
+        assert has_required_role({"role": "admin"}, "user") is True
+
+    def test_user_passes_user_check(self):
+        from app.auth_middleware import has_required_role
+        assert has_required_role({"role": "user"}, "user") is True
+
+
+class TestTokenExtraction:
+
+    def test_extracts_bearer_token(self):
+        from app.auth_middleware import extract_token_from_header
+        token = extract_token_from_header("Bearer mytoken123")
+        assert token == "mytoken123"
+
+    def test_missing_header_returns_none(self):
+        from app.auth_middleware import extract_token_from_header
+        assert extract_token_from_header(None) is None
+
+    def test_malformed_header_returns_none(self):
+        from app.auth_middleware import extract_token_from_header
+        assert extract_token_from_header("NotBearer token") is None
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\dispatcher\tests\test_logging.py ---
+"""
+TDD - RED PHASE: Request logging tests for the Dispatcher.
+Written BEFORE implementation (Red-Green-Refactor cycle).
+File created: dispatcher/tests/test_logging.py  <-- BEFORE dispatcher/app/logger.py
+"""
+import pytest
+import sys
+import os
+from datetime import datetime
+from unittest.mock import MagicMock, AsyncMock
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+
+class TestRequestLogger:
+
+    def test_log_entry_has_all_required_fields(self):
+        from app.logger import RequestLogger
+        logger = RequestLogger(db=MagicMock())
+        entry = logger.build_log_entry(
+            method="GET",
+            path="/api/messages",
+            user_id="user123",
+            target_service="message-service",
+            status_code=200,
+            response_time_ms=45.2
+        )
+        required_fields = ["method", "path", "user_id", "target_service",
+                           "status_code", "response_time_ms", "timestamp"]
+        for field in required_fields:
+            assert field in entry, f"Missing field: {field}"
+
+    def test_log_entry_timestamp_is_datetime(self):
+        from app.logger import RequestLogger
+        logger = RequestLogger(db=MagicMock())
+        entry = logger.build_log_entry(
+            method="POST", path="/auth/login", user_id=None,
+            target_service="login-service", status_code=200, response_time_ms=10.0
+        )
+        assert isinstance(entry["timestamp"], datetime)
+
+    def test_log_entry_captures_502_error(self):
+        from app.logger import RequestLogger
+        logger = RequestLogger(db=MagicMock())
+        entry = logger.build_log_entry(
+            method="GET", path="/api/messages", user_id="u1",
+            target_service="message-service", status_code=502,
+            response_time_ms=5000.0, error="Connection refused"
+        )
+        assert entry["status_code"] == 502
+        assert entry["error"] == "Connection refused"
+
+    def test_log_entry_anonymous_user(self):
+        from app.logger import RequestLogger
+        logger = RequestLogger(db=MagicMock())
+        entry = logger.build_log_entry(
+            method="POST", path="/auth/login", user_id=None,
+            target_service="login-service", status_code=200, response_time_ms=5.0
+        )
+        assert entry["user_id"] is None
+
+    def test_log_entry_stores_ip_and_user_agent(self):
+        from app.logger import RequestLogger
+        logger = RequestLogger(db=MagicMock())
+        entry = logger.build_log_entry(
+            method="GET", path="/api/users", user_id="u1",
+            target_service="user-service", status_code=200,
+            response_time_ms=12.0, ip_address="127.0.0.1",
+            user_agent="Mozilla/5.0"
+        )
+        assert entry["ip_address"] == "127.0.0.1"
+        assert entry["user_agent"] == "Mozilla/5.0"
+
+
+class TestLogStatistics:
+
+    def test_statistics_model_fields(self):
+        from app.logger import LogStatistics
+        stats = LogStatistics(
+            total_requests=500,
+            success_count=480,
+            error_count=20,
+            avg_response_time_ms=67.4,
+            requests_per_service={"message-service": 200, "user-service": 150}
+        )
+        assert stats.total_requests == 500
+        assert stats.success_count == 480
+        assert stats.error_count == 20
+        assert stats.avg_response_time_ms == 67.4
+        assert stats.requests_per_service["message-service"] == 200
+
+    def test_zero_statistics(self):
+        from app.logger import LogStatistics
+        stats = LogStatistics(
+            total_requests=0, success_count=0, error_count=0,
+            avg_response_time_ms=0.0, requests_per_service={}
+        )
+        assert stats.total_requests == 0
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\dispatcher\tests\test_routing.py ---
+"""
+TDD - RED PHASE: Routing tests for the Dispatcher API Gateway.
+Written BEFORE implementation (Red-Green-Refactor cycle).
+File created: dispatcher/tests/test_routing.py  <-- BEFORE dispatcher/app/router.py
+"""
+import pytest
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+
+class TestServiceRouting:
+    """Tests for URL-based routing to microservices."""
+
+    def test_auth_login_routes_to_login_service(self):
+        from app.router import get_service_url
+        result = get_service_url("POST", "/auth/login")
+        assert result is not None
+        target_url, service = result
+        assert service == "login-service"
+
+    def test_auth_register_routes_to_login_service(self):
+        from app.router import get_service_url
+        result = get_service_url("POST", "/auth/register")
+        assert result is not None
+        _, service = result
+        assert service == "login-service"
+
+    def test_messages_routes_to_message_service(self):
+        from app.router import get_service_url
+        result = get_service_url("GET", "/api/messages")
+        assert result is not None
+        _, service = result
+        assert service == "message-service"
+
+    def test_users_routes_to_user_service(self):
+        from app.router import get_service_url
+        result = get_service_url("GET", "/api/users")
+        assert result is not None
+        _, service = result
+        assert service == "user-service"
+
+    def test_products_routes_to_product_service(self):
+        from app.router import get_service_url
+        result = get_service_url("GET", "/api/products")
+        assert result is not None
+        _, service = result
+        assert service == "product-service"
+
+    def test_reports_routes_to_report_service(self):
+        from app.router import get_service_url
+        result = get_service_url("GET", "/api/reports")
+        assert result is not None
+        _, service = result
+        assert service == "report-service"
+
+    def test_unknown_route_returns_none(self):
+        from app.router import get_service_url
+        result = get_service_url("GET", "/api/unknown")
+        assert result is None
+
+    def test_nested_path_routes_correctly(self):
+        from app.router import get_service_url
+        result = get_service_url("GET", "/api/messages/123")
+        assert result is not None
+        target_url, service = result
+        assert service == "message-service"
+        assert "/api/messages/123" in target_url
+
+    def test_delete_user_preserves_path(self):
+        from app.router import get_service_url
+        result = get_service_url("DELETE", "/api/users/abc123")
+        assert result is not None
+        target_url, service = result
+        assert service == "user-service"
+        assert "/api/users/abc123" in target_url
+
+    def test_put_product_preserves_path(self):
+        from app.router import get_service_url
+        result = get_service_url("PUT", "/api/products/xyz")
+        assert result is not None
+        target_url, _ = result
+        assert "/api/products/xyz" in target_url
+
+    def test_report_sub_path_routes_correctly(self):
+        from app.router import get_service_url
+        result = get_service_url("GET", "/api/reports/summary")
+        assert result is not None
+        _, service = result
+        assert service == "report-service"
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\dispatcher\tests\__init__.py ---
+# empty init
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\load-testing\k6_script.js ---
+/**
+ * k6 Load Testing Script â€” Dispatcher API Gateway
+ * Tests: 50, 100, 200, 500 Virtual Users
+ *
+ * Run: k6 run k6_script.js
+ * Run with VUs: k6 run --vus 100 --duration 30s k6_script.js
+ */
+import http from 'k6/http';
+import { check, sleep, group } from 'k6';
+import { Rate, Trend, Counter } from 'k6/metrics';
+
+// â”€â”€â”€ Custom Metrics â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+const errorRate       = new Rate('error_rate');
+const routingAccuracy = new Rate('routing_accuracy');
+const loginLatency    = new Trend('login_latency_ms');
+const messageLatency  = new Trend('message_latency_ms');
+const userLatency     = new Trend('user_latency_ms');
+const productLatency  = new Trend('product_latency_ms');
+const reportLatency   = new Trend('report_latency_ms');
+const totalRequests   = new Counter('total_requests');
+
+// â”€â”€â”€ Configuration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+const BASE_URL = __ENV.BASE_URL || 'http://localhost:8000';
+
+export const options = {
+  scenarios: {
+    load_50: {
+      executor: 'constant-vus',
+      vus: 50,
+      duration: '30s',
+      startTime: '0s',
+      tags: { scenario: 'vus_50' },
+    },
+    load_100: {
+      executor: 'constant-vus',
+      vus: 100,
+      duration: '30s',
+      startTime: '35s',
+      tags: { scenario: 'vus_100' },
+    },
+    load_200: {
+      executor: 'constant-vus',
+      vus: 200,
+      duration: '30s',
+      startTime: '70s',
+      tags: { scenario: 'vus_200' },
+    },
+    load_500: {
+      executor: 'constant-vus',
+      vus: 500,
+      duration: '30s',
+      startTime: '105s',
+      tags: { scenario: 'vus_500' },
+    },
+  },
+  thresholds: {
+    http_req_duration:  ['p(95)<2000'],
+    error_rate:         ['rate<0.05'],
+    routing_accuracy:   ['rate>0.95'],
+  },
+};
+
+// â”€â”€â”€ Shared state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+let authToken = '';
+
+// â”€â”€â”€ Setup: create test user and get token â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+export function setup() {
+  const username = `loadtest_${Date.now()}`;
+
+  // Register
+  const regRes = http.post(`${BASE_URL}/auth/register`, JSON.stringify({
+    username, email: `${username}@test.com`, password: 'TestPass123!', role: 'user'
+  }), { headers: { 'Content-Type': 'application/json' } });
+
+  // Login
+  const loginRes = http.post(`${BASE_URL}/auth/login`, JSON.stringify({
+    username, password: 'TestPass123!'
+  }), { headers: { 'Content-Type': 'application/json' } });
+
+  const body = JSON.parse(loginRes.body || '{}');
+  return { token: body.access_token || '' };
+}
+
+// â”€â”€â”€ Main test function â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+export default function (data) {
+  const token = data.token;
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${token}`,
+  };
+
+  group('Health Check', () => {
+    const res = http.get(`${BASE_URL}/health`);
+    totalRequests.add(1);
+    const ok = check(res, { 'health 200': (r) => r.status === 200 });
+    errorRate.add(!ok);
+    routingAccuracy.add(ok);
+  });
+
+  group('Auth â€” Login', () => {
+    const start = Date.now();
+    const res = http.post(`${BASE_URL}/auth/login`, JSON.stringify({
+      username: 'nonexistent_user_test', password: 'wrong'
+    }), { headers: { 'Content-Type': 'application/json' } });
+    loginLatency.add(Date.now() - start);
+    totalRequests.add(1);
+    const ok = check(res, { 'auth routed (401 expected)': (r) => r.status === 401 || r.status === 200 });
+    routingAccuracy.add(ok);
+    errorRate.add(res.status >= 500);
+  });
+
+  group('Messages Service', () => {
+    const start = Date.now();
+    const res = http.get(`${BASE_URL}/api/messages`, { headers });
+    messageLatency.add(Date.now() - start);
+    totalRequests.add(1);
+    const ok = check(res, {
+      'message service responds': (r) => r.status !== 503 && r.status !== 504,
+      'message status valid': (r) => [200, 401, 403].includes(r.status),
+    });
+    errorRate.add(res.status >= 500);
+    routingAccuracy.add(res.status !== 404);
+  });
+
+  group('User Service', () => {
+    const start = Date.now();
+    const res = http.get(`${BASE_URL}/api/users`, { headers });
+    userLatency.add(Date.now() - start);
+    totalRequests.add(1);
+    const ok = check(res, {
+      'user service responds': (r) => r.status !== 503 && r.status !== 504,
+    });
+    errorRate.add(res.status >= 500);
+    routingAccuracy.add(res.status !== 404);
+  });
+
+  group('Product Service', () => {
+    const start = Date.now();
+    const res = http.get(`${BASE_URL}/api/products`, { headers });
+    productLatency.add(Date.now() - start);
+    totalRequests.add(1);
+    const ok = check(res, {
+      'product service responds': (r) => r.status !== 503 && r.status !== 504,
+    });
+    errorRate.add(res.status >= 500);
+    routingAccuracy.add(res.status !== 404);
+  });
+
+  group('Report Service', () => {
+    const start = Date.now();
+    const res = http.get(`${BASE_URL}/api/reports`, { headers });
+    reportLatency.add(Date.now() - start);
+    totalRequests.add(1);
+    const ok = check(res, {
+      'report service responds': (r) => r.status !== 503 && r.status !== 504,
+    });
+    errorRate.add(res.status >= 500);
+    routingAccuracy.add(res.status !== 404);
+  });
+
+  group('Invalid Route â€” 404 expected', () => {
+    const res = http.get(`${BASE_URL}/api/nonexistent-service`, { headers });
+    totalRequests.add(1);
+    const correct404 = check(res, { 'returns 404 for unknown route': (r) => r.status === 404 });
+    routingAccuracy.add(correct404);
+    errorRate.add(!correct404 && res.status >= 500);
+  });
+
+  group('Unauthorized â€” no token', () => {
+    const res = http.get(`${BASE_URL}/api/messages`);
+    totalRequests.add(1);
+    const correct401 = check(res, { 'returns 401 without token': (r) => r.status === 401 });
+    routingAccuracy.add(correct401);
+  });
+
+  sleep(0.1);
+}
+
+// â”€â”€â”€ Teardown: print summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+export function teardown(data) {
+  console.log('Load test complete. Check results above.');
+}
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\login-service\app\config.py ---
+import os
+
+
+class Settings:
+    mongo_uri: str = os.getenv("MONGO_URI", "mongodb://localhost:27017/login_db")
+    jwt_secret: str = os.getenv("JWT_SECRET", "dev-secret-key")
+    jwt_algorithm: str = "HS256"
+    jwt_expire_hours: int = 24
+    internal_api_key: str = os.getenv("INTERNAL_API_KEY", "internal-dev-key")
+    port: int = int(os.getenv("PORT", "5001"))
+
+
+settings = Settings()
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\login-service\app\database.py ---
+from motor.motor_asyncio import AsyncIOMotorClient
+from app.config import settings
+
+_client = None
+_db = None
+
+
+async def connect_to_mongo():
+    global _client, _db
+    _client = AsyncIOMotorClient(settings.mongo_uri)
+    _db = _client.get_default_database()
+    await _db.users.create_index("email", unique=True)
+    await _db.users.create_index("username", unique=True)
+    print("[Login Service] Connected to MongoDB")
+
+
+async def close_mongo_connection():
+    global _client
+    if _client:
+        _client.close()
+
+
+def get_db():
+    return _db
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\login-service\app\main.py ---
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from app.database import connect_to_mongo, close_mongo_connection
+from app.routes import router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await connect_to_mongo()
+    yield
+    await close_mongo_connection()
+
+
+app = FastAPI(title="Login Service", version="1.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
+app.include_router(router)
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\login-service\app\models.py ---
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime
+
+
+class UserCreate(BaseModel):
+    username: str
+    email: str
+    password: str
+    role: str = "user"
+
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+
+class UserResponse(BaseModel):
+    id: str
+    username: str
+    email: str
+    role: str
+    created_at: datetime
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user_id: str
+    username: str
+    role: str
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\login-service\app\routes.py ---
+from fastapi import APIRouter, HTTPException, Header
+from datetime import datetime, timedelta
+from typing import Optional
+import jwt
+from passlib.context import CryptContext
+
+from app.models import UserCreate, UserLogin, TokenResponse, UserResponse
+from app.database import get_db
+from app.config import settings
+
+router = APIRouter()
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def _verify_internal_key(x_internal_api_key: Optional[str]) -> None:
+    """Reject requests that don't come from the Dispatcher."""
+    if x_internal_api_key != settings.internal_api_key:
+        raise HTTPException(status_code=403, detail="Forbidden: direct access not allowed")
+
+
+def _create_token(user_id: str, username: str, role: str) -> str:
+    payload = {
+        "sub": user_id,
+        "username": username,
+        "role": role,
+        "exp": datetime.utcnow() + timedelta(hours=settings.jwt_expire_hours),
+        "iat": datetime.utcnow(),
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+@router.post("/auth/register", response_model=UserResponse, status_code=201)
+async def register(
+    body: UserCreate,
+    x_internal_api_key: Optional[str] = Header(None),
+):
+    _verify_internal_key(x_internal_api_key)
+    db = get_db()
+
+    if await db.users.find_one({"username": body.username}):
+        raise HTTPException(status_code=409, detail="Username already exists")
+    if await db.users.find_one({"email": body.email}):
+        raise HTTPException(status_code=409, detail="Email already exists")
+
+    hashed = pwd_context.hash(body.password)
+    now = datetime.utcnow()
+    doc = {
+        "username": body.username,
+        "email": body.email,
+        "password_hash": hashed,
+        "role": body.role,
+        "created_at": now,
+    }
+    result = await db.users.insert_one(doc)
+    return UserResponse(
+        id=str(result.inserted_id),
+        username=body.username,
+        email=body.email,
+        role=body.role,
+        created_at=now,
+    )
+
+
+@router.post("/auth/login", response_model=TokenResponse)
+async def login(
+    body: UserLogin,
+    x_internal_api_key: Optional[str] = Header(None),
+):
+    _verify_internal_key(x_internal_api_key)
+    db = get_db()
+
+    user = await db.users.find_one({"username": body.username})
+    if not user or not pwd_context.verify(body.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = _create_token(str(user["_id"]), user["username"], user["role"])
+    return TokenResponse(
+        access_token=token,
+        user_id=str(user["_id"]),
+        username=user["username"],
+        role=user["role"],
+    )
+
+
+@router.get("/auth/validate")
+async def validate(x_internal_api_key: Optional[str] = Header(None)):
+    _verify_internal_key(x_internal_api_key)
+    return {"status": "ok"}
+
+
+@router.get("/health")
+async def health():
+    return {"status": "healthy", "service": "login-service"}
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\login-service\app\__init__.py ---
+# login-service/app/__init__.py
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\message-service\app\config.py ---
+import os
+
+
+class Settings:
+    mongo_uri: str = os.getenv("MONGO_URI", "mongodb://localhost:27017/message_db")
+    internal_api_key: str = os.getenv("INTERNAL_API_KEY", "internal-dev-key")
+    port: int = int(os.getenv("PORT", "5002"))
+
+
+settings = Settings()
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\message-service\app\database.py ---
+from motor.motor_asyncio import AsyncIOMotorClient
+from app.config import settings
+
+_client = None
+_db = None
+
+
+async def connect_to_mongo():
+    global _client, _db
+    _client = AsyncIOMotorClient(settings.mongo_uri)
+    _db = _client.get_default_database()
+    await _db.messages.create_index("sender_id")
+    await _db.messages.create_index("created_at")
+    print("[Message Service] Connected to MongoDB")
+
+
+async def close_mongo_connection():
+    global _client
+    if _client:
+        _client.close()
+
+
+def get_db():
+    return _db
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\message-service\app\main.py ---
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from app.database import connect_to_mongo, close_mongo_connection
+from app.routes import router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await connect_to_mongo()
+    yield
+    await close_mongo_connection()
+
+
+app = FastAPI(title="Message Service", version="1.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
+app.include_router(router)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "service": "message-service"}
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\message-service\app\middleware.py ---
+from fastapi import HTTPException, Header
+from typing import Optional
+from app.config import settings
+
+
+def verify_internal_key(x_internal_api_key: Optional[str] = Header(None)) -> None:
+    """Dependency: reject requests that don't carry the internal API key."""
+    if x_internal_api_key != settings.internal_api_key:
+        raise HTTPException(status_code=403, detail="Forbidden: direct access not allowed")
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\message-service\app\models.py ---
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime
+
+
+class MessageCreate(BaseModel):
+    content: str
+    recipient_id: Optional[str] = None
+    channel: str = "general"
+
+
+class MessageUpdate(BaseModel):
+    content: Optional[str] = None
+    channel: Optional[str] = None
+
+
+class MessageResponse(BaseModel):
+    id: str
+    content: str
+    sender_id: str
+    recipient_id: Optional[str]
+    channel: str
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\message-service\app\routes.py ---
+from fastapi import APIRouter, HTTPException, Depends, Header
+from bson import ObjectId
+from datetime import datetime
+from typing import Optional, List
+
+from app.models import MessageCreate, MessageUpdate, MessageResponse
+from app.database import get_db
+from app.middleware import verify_internal_key
+
+router = APIRouter(prefix="/api/messages", tags=["messages"])
+
+
+def _doc_to_response(doc: dict) -> MessageResponse:
+    return MessageResponse(
+        id=str(doc["_id"]),
+        content=doc["content"],
+        sender_id=doc["sender_id"],
+        recipient_id=doc.get("recipient_id"),
+        channel=doc.get("channel", "general"),
+        created_at=doc["created_at"],
+        updated_at=doc.get("updated_at"),
+    )
+
+
+@router.get("/health")
+async def health():
+    return {"status": "healthy", "service": "message-service"}
+
+
+@router.get("", dependencies=[Depends(verify_internal_key)])
+async def list_messages(
+    channel: Optional[str] = None,
+    limit: int = 50,
+    x_user_id: Optional[str] = Header(None),
+):
+    db = get_db()
+    query = {}
+    if channel:
+        query["channel"] = channel
+    cursor = db.messages.find(query).sort("created_at", -1).limit(limit)
+    docs = await cursor.to_list(limit)
+    return [_doc_to_response(d) for d in docs]
+
+
+@router.post("", status_code=201, dependencies=[Depends(verify_internal_key)])
+async def create_message(
+    body: MessageCreate,
+    x_user_id: Optional[str] = Header(None),
+):
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="User identity missing")
+    db = get_db()
+    now = datetime.utcnow()
+    doc = {
+        "content": body.content,
+        "sender_id": x_user_id,
+        "recipient_id": body.recipient_id,
+        "channel": body.channel,
+        "created_at": now,
+    }
+    result = await db.messages.insert_one(doc)
+    doc["_id"] = result.inserted_id
+    return _doc_to_response(doc)
+
+
+@router.get("/{message_id}", dependencies=[Depends(verify_internal_key)])
+async def get_message(message_id: str):
+    db = get_db()
+    try:
+        oid = ObjectId(message_id)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid message ID")
+    doc = await db.messages.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return _doc_to_response(doc)
+
+
+@router.put("/{message_id}", dependencies=[Depends(verify_internal_key)])
+async def update_message(
+    message_id: str,
+    body: MessageUpdate,
+    x_user_id: Optional[str] = Header(None),
+):
+    db = get_db()
+    try:
+        oid = ObjectId(message_id)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid message ID")
+    doc = await db.messages.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if doc["sender_id"] != x_user_id:
+        raise HTTPException(status_code=403, detail="Cannot edit another user's message")
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    updates["updated_at"] = datetime.utcnow()
+    await db.messages.update_one({"_id": oid}, {"$set": updates})
+    doc.update(updates)
+    return _doc_to_response(doc)
+
+
+@router.delete("/{message_id}", status_code=204, dependencies=[Depends(verify_internal_key)])
+async def delete_message(
+    message_id: str,
+    x_user_id: Optional[str] = Header(None),
+):
+    db = get_db()
+    try:
+        oid = ObjectId(message_id)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid message ID")
+    doc = await db.messages.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if doc["sender_id"] != x_user_id:
+        raise HTTPException(status_code=403, detail="Cannot delete another user's message")
+    await db.messages.delete_one({"_id": oid})
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\message-service\app\__init__.py ---
+# message-service/app/__init__.py
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\product-service\src\middleware\authMiddleware.js ---
+const mongoose = require('mongoose');
+
+/**
+ * Middleware: reject requests that don't carry the dispatcher's internal API key.
+ */
+function verifyInternalKey(req, res, next) {
+  const key = req.headers['x-internal-api-key'];
+  const expected = process.env.INTERNAL_API_KEY || 'internal-dev-key';
+  if (key !== expected) {
+    return res.status(403).json({ detail: 'Forbidden: direct access not allowed' });
+  }
+  next();
+}
+
+module.exports = { verifyInternalKey };
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\product-service\src\models\Product.js ---
+const mongoose = require('mongoose');
+
+const productSchema = new mongoose.Schema({
+  name:        { type: String, required: true, trim: true },
+  description: { type: String, default: '' },
+  price:       { type: Number, required: true, min: 0 },
+  category:    { type: String, default: 'general' },
+  stock:       { type: Number, default: 0, min: 0 },
+  sellerId:    { type: String, required: true },
+  isAvailable: { type: Boolean, default: true },
+  imageUrl:    { type: String, default: '' },
+}, { timestamps: true });
+
+productSchema.index({ category: 1 });
+productSchema.index({ sellerId: 1 });
+
+module.exports = mongoose.model('Product', productSchema);
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\product-service\src\routes\productRoutes.js ---
+const express = require('express');
+const router = express.Router();
+const Product = require('../models/Product');
+const { verifyInternalKey } = require('../middleware/authMiddleware');
+
+// All routes require internal key
+router.use(verifyInternalKey);
+
+// GET /api/products
+router.get('/', async (req, res) => {
+  try {
+    const { category, limit = 50, page = 1 } = req.query;
+    const query = { isAvailable: true };
+    if (category) query.category = category;
+    const products = await Product.find(query)
+      .select('-__v')
+      .limit(Number(limit))
+      .skip((Number(page) - 1) * Number(limit))
+      .sort({ createdAt: -1 });
+    return res.status(200).json(products);
+  } catch (err) {
+    return res.status(500).json({ detail: 'Internal server error' });
+  }
+});
+
+// POST /api/products
+router.post('/', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'];
+    if (!userId) return res.status(401).json({ detail: 'User identity missing' });
+    const { name, description, price, category, stock, imageUrl } = req.body;
+    if (!name || price === undefined) {
+      return res.status(422).json({ detail: 'name and price are required' });
+    }
+    const product = await Product.create({
+      name, description, price, category, stock, imageUrl, sellerId: userId
+    });
+    return res.status(201).json(product);
+  } catch (err) {
+    return res.status(500).json({ detail: 'Internal server error' });
+  }
+});
+
+// GET /api/products/:id
+router.get('/:id', async (req, res) => {
+  try {
+    const product = await Product.findById(req.params.id).select('-__v');
+    if (!product) return res.status(404).json({ detail: 'Product not found' });
+    return res.status(200).json(product);
+  } catch (err) {
+    return res.status(422).json({ detail: 'Invalid product ID' });
+  }
+});
+
+// PUT /api/products/:id
+router.put('/:id', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'];
+    const allowed = ['name', 'description', 'price', 'category', 'stock', 'imageUrl', 'isAvailable'];
+    const updates = {};
+    allowed.forEach(f => { if (req.body[f] !== undefined) updates[f] = req.body[f]; });
+
+    const product = await Product.findById(req.params.id);
+    if (!product) return res.status(404).json({ detail: 'Product not found' });
+    if (product.sellerId !== userId) {
+      return res.status(403).json({ detail: 'Cannot modify another seller\'s product' });
+    }
+    Object.assign(product, updates);
+    await product.save();
+    return res.status(200).json(product);
+  } catch (err) {
+    return res.status(422).json({ detail: 'Invalid request' });
+  }
+});
+
+// DELETE /api/products/:id
+router.delete('/:id', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'];
+    const product = await Product.findById(req.params.id);
+    if (!product) return res.status(404).json({ detail: 'Product not found' });
+    if (product.sellerId !== userId) {
+      return res.status(403).json({ detail: 'Cannot delete another seller\'s product' });
+    }
+    product.isAvailable = false;
+    await product.save();
+    return res.status(204).send();
+  } catch (err) {
+    return res.status(422).json({ detail: 'Invalid product ID' });
+  }
+});
+
+module.exports = router;
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\product-service\src\app.js ---
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const productRoutes = require('./routes/productRoutes');
+
+const app = express();
+const PORT = process.env.PORT || 5004;
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/product_db';
+
+app.use(cors());
+app.use(express.json());
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'healthy', service: 'product-service' });
+});
+
+app.use('/api/products', productRoutes);
+
+mongoose.connect(MONGO_URI)
+  .then(() => {
+    console.log('[Product Service] Connected to MongoDB');
+    app.listen(PORT, () => console.log(`[Product Service] Running on :${PORT}`));
+  })
+  .catch(err => {
+    console.error('[Product Service] MongoDB connection failed:', err);
+    process.exit(1);
+  });
+
+module.exports = app;
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\product-service\tests\product.test.js ---
+/**
+ * Jest tests for Product Service â€” TDD approach
+ */
+describe('Product Service â€” Internal Key Middleware', () => {
+  const { verifyInternalKey } = require('../src/middleware/authMiddleware');
+
+  test('allows request with correct internal key', () => {
+    process.env.INTERNAL_API_KEY = 'internal-dev-key';
+    const req = { headers: { 'x-internal-api-key': 'internal-dev-key' } };
+    const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+    const next = jest.fn();
+    verifyInternalKey(req, res, next);
+    expect(next).toHaveBeenCalled();
+  });
+
+  test('rejects request with wrong key â€” returns 403', () => {
+    const req = { headers: { 'x-internal-api-key': 'bad-key' } };
+    const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+    const next = jest.fn();
+    verifyInternalKey(req, res, next);
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  test('rejects missing key â€” returns 403', () => {
+    const req = { headers: {} };
+    const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+    const next = jest.fn();
+    verifyInternalKey(req, res, next);
+    expect(res.status).toHaveBeenCalledWith(403);
+  });
+});
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\report-service\app\config.py ---
+import os
+
+
+class Settings:
+    mongo_uri: str = os.getenv("MONGO_URI", "mongodb://localhost:27017/report_db")
+    internal_api_key: str = os.getenv("INTERNAL_API_KEY", "internal-dev-key")
+    port: int = int(os.getenv("PORT", "5005"))
+
+
+settings = Settings()
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\report-service\app\database.py ---
+from motor.motor_asyncio import AsyncIOMotorClient
+from app.config import settings
+
+_client = None
+_db = None
+
+
+async def connect_to_mongo():
+    global _client, _db
+    _client = AsyncIOMotorClient(settings.mongo_uri)
+    _db = _client.get_default_database()
+    await _db.reports.create_index("report_type")
+    await _db.reports.create_index("created_at")
+    print("[Report Service] Connected to MongoDB")
+
+
+async def close_mongo_connection():
+    global _client
+    if _client:
+        _client.close()
+
+
+def get_db():
+    return _db
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\report-service\app\main.py ---
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from app.database import connect_to_mongo, close_mongo_connection
+from app.routes import router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await connect_to_mongo()
+    yield
+    await close_mongo_connection()
+
+
+app = FastAPI(title="Report Service", version="1.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
+app.include_router(router)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "service": "report-service"}
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\report-service\app\models.py ---
+from pydantic import BaseModel
+from typing import Optional, Any
+from datetime import datetime
+
+
+class ReportCreate(BaseModel):
+    report_type: str  # e.g. "traffic", "sales", "user_activity"
+    title: str
+    description: Optional[str] = None
+    data: Optional[Any] = None
+
+
+class ReportResponse(BaseModel):
+    id: str
+    report_type: str
+    title: str
+    description: Optional[str]
+    data: Optional[Any]
+    created_by: str
+    created_at: datetime
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\report-service\app\routes.py ---
+from fastapi import APIRouter, HTTPException, Header
+from bson import ObjectId
+from datetime import datetime
+from typing import Optional, List
+
+from app.models import ReportCreate, ReportResponse
+from app.database import get_db
+from app.config import settings
+
+router = APIRouter(prefix="/api/reports", tags=["reports"])
+
+
+def _verify_key(x_internal_api_key: Optional[str]) -> None:
+    if x_internal_api_key != settings.internal_api_key:
+        raise HTTPException(status_code=403, detail="Forbidden: direct access not allowed")
+
+
+def _doc_to_response(doc: dict) -> ReportResponse:
+    return ReportResponse(
+        id=str(doc["_id"]),
+        report_type=doc["report_type"],
+        title=doc["title"],
+        description=doc.get("description"),
+        data=doc.get("data"),
+        created_by=doc["created_by"],
+        created_at=doc["created_at"],
+    )
+
+
+@router.get("")
+async def list_reports(
+    report_type: Optional[str] = None,
+    limit: int = 50,
+    x_internal_api_key: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
+):
+    _verify_key(x_internal_api_key)
+    db = get_db()
+    query = {}
+    if report_type:
+        query["report_type"] = report_type
+    cursor = db.reports.find(query, {"_id": 1, "report_type": 1,
+                                     "title": 1, "description": 1,
+                                     "created_by": 1, "created_at": 1}).sort("created_at", -1).limit(limit)
+    docs = await cursor.to_list(limit)
+    return [_doc_to_response(d) for d in docs]
+
+
+@router.post("", status_code=201)
+async def create_report(
+    body: ReportCreate,
+    x_internal_api_key: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
+):
+    _verify_key(x_internal_api_key)
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="User identity missing")
+    db = get_db()
+    doc = {
+        "report_type": body.report_type,
+        "title": body.title,
+        "description": body.description,
+        "data": body.data,
+        "created_by": x_user_id,
+        "created_at": datetime.utcnow(),
+    }
+    result = await db.reports.insert_one(doc)
+    doc["_id"] = result.inserted_id
+    return _doc_to_response(doc)
+
+
+@router.get("/{report_id}")
+async def get_report(
+    report_id: str,
+    x_internal_api_key: Optional[str] = Header(None),
+):
+    _verify_key(x_internal_api_key)
+    db = get_db()
+    try:
+        oid = ObjectId(report_id)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid report ID")
+    doc = await db.reports.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return _doc_to_response(doc)
+
+
+@router.delete("/{report_id}", status_code=204)
+async def delete_report(
+    report_id: str,
+    x_internal_api_key: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
+):
+    _verify_key(x_internal_api_key)
+    db = get_db()
+    try:
+        oid = ObjectId(report_id)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid report ID")
+    doc = await db.reports.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Report not found")
+    if doc["created_by"] != x_user_id:
+        raise HTTPException(status_code=403, detail="Cannot delete another user's report")
+    await db.reports.delete_one({"_id": oid})
+
+
+@router.get("/summary/stats")
+async def report_summary(x_internal_api_key: Optional[str] = Header(None)):
+    _verify_key(x_internal_api_key)
+    db = get_db()
+    pipeline = [{"$group": {"_id": "$report_type", "count": {"$sum": 1}}}]
+    result = await db.reports.aggregate(pipeline).to_list(100)
+    total = await db.reports.count_documents({})
+    return {
+        "total_reports": total,
+        "by_type": {item["_id"]: item["count"] for item in result}
+    }
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\report-service\app\__init__.py ---
+# report-service/app/__init__.py
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\user-service\src\middleware\authMiddleware.js ---
+const mongoose = require('mongoose');
+
+const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || 'internal-dev-key';
+
+/**
+ * Middleware: reject requests that don't carry the dispatcher's internal API key.
+ * Implements the second layer of authorization within the microservice.
+ */
+function verifyInternalKey(req, res, next) {
+  const key = req.headers['x-internal-api-key'];
+  if (key !== INTERNAL_API_KEY) {
+    return res.status(403).json({ detail: 'Forbidden: direct access not allowed' });
+  }
+  next();
+}
+
+module.exports = { verifyInternalKey };
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\user-service\src\models\User.js ---
+const mongoose = require('mongoose');
+
+const userSchema = new mongoose.Schema({
+  username:   { type: String, required: true, unique: true, trim: true },
+  email:      { type: String, required: true, unique: true, lowercase: true },
+  fullName:   { type: String, default: '' },
+  bio:        { type: String, default: '' },
+  avatarUrl:  { type: String, default: '' },
+  isActive:   { type: Boolean, default: true },
+}, { timestamps: true });
+
+module.exports = mongoose.model('User', userSchema);
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\user-service\src\routes\userRoutes.js ---
+const express = require('express');
+const router = express.Router();
+const User = require('../models/User');
+const { verifyInternalKey } = require('../middleware/authMiddleware');
+
+// All routes require internal key
+router.use(verifyInternalKey);
+
+// GET /api/users â€” list all users
+router.get('/', async (req, res) => {
+  try {
+    const { limit = 50, page = 1 } = req.query;
+    const users = await User.find({ isActive: true })
+      .select('-__v')
+      .limit(Number(limit))
+      .skip((Number(page) - 1) * Number(limit))
+      .sort({ createdAt: -1 });
+    return res.status(200).json(users);
+  } catch (err) {
+    return res.status(500).json({ detail: 'Internal server error' });
+  }
+});
+
+// POST /api/users â€” create user
+router.post('/', async (req, res) => {
+  try {
+    const { username, email, fullName, bio, avatarUrl } = req.body;
+    if (!username || !email) {
+      return res.status(422).json({ detail: 'username and email are required' });
+    }
+    const user = await User.create({ username, email, fullName, bio, avatarUrl });
+    return res.status(201).json(user);
+  } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ detail: 'Username or email already exists' });
+    }
+    return res.status(500).json({ detail: 'Internal server error' });
+  }
+});
+
+// GET /api/users/:id â€” get by ID
+router.get('/:id', async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id).select('-__v');
+    if (!user) return res.status(404).json({ detail: 'User not found' });
+    return res.status(200).json(user);
+  } catch (err) {
+    return res.status(422).json({ detail: 'Invalid user ID' });
+  }
+});
+
+// PUT /api/users/:id â€” update user
+router.put('/:id', async (req, res) => {
+  try {
+    const allowed = ['fullName', 'bio', 'avatarUrl', 'isActive'];
+    const updates = {};
+    allowed.forEach(f => { if (req.body[f] !== undefined) updates[f] = req.body[f]; });
+
+    const user = await User.findByIdAndUpdate(
+      req.params.id, { $set: updates }, { new: true, runValidators: true }
+    ).select('-__v');
+    if (!user) return res.status(404).json({ detail: 'User not found' });
+    return res.status(200).json(user);
+  } catch (err) {
+    return res.status(422).json({ detail: 'Invalid request' });
+  }
+});
+
+// DELETE /api/users/:id â€” soft delete
+router.delete('/:id', async (req, res) => {
+  try {
+    const user = await User.findByIdAndUpdate(
+      req.params.id, { isActive: false }, { new: true }
+    );
+    if (!user) return res.status(404).json({ detail: 'User not found' });
+    return res.status(204).send();
+  } catch (err) {
+    return res.status(422).json({ detail: 'Invalid user ID' });
+  }
+});
+
+module.exports = router;
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\user-service\src\app.js ---
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const userRoutes = require('./routes/userRoutes');
+
+const app = express();
+const PORT = process.env.PORT || 5003;
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/user_db';
+
+app.use(cors());
+app.use(express.json());
+
+// Health check (no auth needed)
+app.get('/health', (req, res) => {
+  res.json({ status: 'healthy', service: 'user-service' });
+});
+
+// User routes
+app.use('/api/users', userRoutes);
+
+// Connect and start
+mongoose.connect(MONGO_URI)
+  .then(() => {
+    console.log('[User Service] Connected to MongoDB');
+    app.listen(PORT, () => console.log(`[User Service] Running on :${PORT}`));
+  })
+  .catch(err => {
+    console.error('[User Service] MongoDB connection failed:', err);
+    process.exit(1);
+  });
+
+module.exports = app;
+
+
+
+--- C:\Users\mehme\OneDrive\Desktop\yazlab2\user-service\tests\user.test.js ---
+/**
+ * Jest tests for User Service â€” TDD approach
+ * Tests the route handlers with mocked middleware
+ */
+const request = require('supertest');
+
+// Mock mongoose before requiring app
+jest.mock('mongoose', () => {
+  const actual = jest.requireActual('mongoose');
+  return {
+    ...actual,
+    connect: jest.fn().mockResolvedValue(true),
+    model: jest.fn().mockReturnValue({}),
+  };
+});
+
+describe('User Service â€” Internal Key Middleware', () => {
+  const { verifyInternalKey } = require('../src/middleware/authMiddleware');
+
+  test('allows request with correct internal key', () => {
+    const req = { headers: { 'x-internal-api-key': 'internal-dev-key' } };
+    const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+    const next = jest.fn();
+    process.env.INTERNAL_API_KEY = 'internal-dev-key';
+    verifyInternalKey(req, res, next);
+    expect(next).toHaveBeenCalled();
+  });
+
+  test('rejects request with wrong key', () => {
+    const req = { headers: { 'x-internal-api-key': 'wrong-key' } };
+    const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+    const next = jest.fn();
+    verifyInternalKey(req, res, next);
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  test('rejects request with no key', () => {
+    const req = { headers: {} };
+    const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+    const next = jest.fn();
+    verifyInternalKey(req, res, next);
+    expect(res.status).toHaveBeenCalledWith(403);
+  });
+});
+
+
+
